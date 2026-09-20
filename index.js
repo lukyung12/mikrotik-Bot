@@ -1,17 +1,14 @@
 /**
- * ZenFii ↔ MikroTik Automated Hotspot User Bridge
- * Uses SSH on port 33548 (XenFii remote access port)
+ * ZenFii ↔ MikroTik Automated Hotspot User Bridge (LOCAL VERSION)
+ * Runs locally on Windows - connects to MikroTik via local network
  * Fetches ZenFii transactions and creates users on MikroTik
  */
 
 const axios = require('axios');
-const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 require('dotenv').config();
-
-const app = express();
 
 // Configuration
 const CONFIG = {
@@ -19,8 +16,8 @@ const CONFIG = {
   zenfiiUsername: process.env.ZENFII_USERNAME || '',
   zenfiiPassword: process.env.ZENFII_PASSWORD || '',
   
-  mikrotikHost: process.env.MIKROTIK_HOST || 'vpn4.xenfi.net',
-  mikrotikPort: parseInt(process.env.MIKROTIK_PORT || 33548),
+  mikrotikHost: process.env.MIKROTIK_HOST || '10.128.10.1',
+  mikrotikPort: parseInt(process.env.MIKROTIK_PORT || 22),
   mikrotikUsername: process.env.MIKROTIK_USERNAME || 'admin',
   mikrotikPassword: process.env.MIKROTIK_PASSWORD || '',
   
@@ -280,7 +277,7 @@ async function poll() {
  * Test MikroTik connection
  */
 async function testMikroTikConnection() {
-  console.log('\n🔗 Testing MikroTik SSH connection (port 33548)...');
+  console.log(`\n🔗 Testing MikroTik SSH connection (${CONFIG.mikrotikHost}:${CONFIG.mikrotikPort})...`);
   try {
     const result = await executeSshCommand('system identity print');
     if (result && result.length > 0) {
@@ -299,11 +296,12 @@ async function testMikroTikConnection() {
 async function start() {
   console.log('════════════════════════════════════════════════════════');
   console.log('ZenFii ↔ MikroTik Automated Hotspot User Bridge');
+  console.log('LOCAL VERSION (Windows)');
   console.log('════════════════════════════════════════════════════════');
   console.log(`
 Configuration:
   - ZenFii: ${CONFIG.zenfiiUrl}
-  - MikroTik: ${CONFIG.mikrotikHost}:${CONFIG.mikrotikPort} (SSH - XenFii Remote)
+  - MikroTik: ${CONFIG.mikrotikHost}:${CONFIG.mikrotikPort} (Local Network)
   - Poll Interval: ${CONFIG.pollInterval / 1000}s
   - Hotspot Profile: ${CONFIG.hotspotProfile}
   `);
@@ -321,29 +319,10 @@ Configuration:
   state.isRunning = true;
   let pollCount = 0;
   
-  // Web server
-  app.get('/health', (req, res) => {
-    res.json({ status: 'ok', isRunning: state.isRunning, pollCount, lastPoll: state.lastPollTime });
-  });
-  
-  app.get('/status', (req, res) => {
-    res.json({
-      isRunning: state.isRunning,
-      pollCount,
-      lastPollTime: state.lastPollTime,
-      processedTransactions: state.processedTransactions.size
-    });
-  });
-  
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`\n🌐 Web server listening on port ${PORT}`);
-    console.log(`   Health: http://localhost:${PORT}/health`);
-  });
+  console.log(`\n🔄 Starting polling loop every ${CONFIG.pollInterval / 1000}s`);
+  console.log('Press Ctrl+C to stop\n');
   
   // Start polling
-  console.log(`\n🔄 Starting polling loop every ${CONFIG.pollInterval / 1000}s`);
-  
   setInterval(async () => {
     pollCount++;
     await poll();
@@ -352,6 +331,13 @@ Configuration:
   // Do first poll immediately
   await poll();
 }
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n\nShutting down gracefully...');
+  saveProcessedTransactions();
+  process.exit(0);
+});
 
 // Start the bot
 start().catch(error => {
