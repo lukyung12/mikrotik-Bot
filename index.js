@@ -1,5 +1,5 @@
 /**
- * ZenFii ↔ MikroTik Automated Hotspot User Bridge
+ * ZenFii ↔ MikroTik Automated Hotspot User Bridge (v2.0)
  * Uses REST API to connect to MikroTik (works with VPN tunnels)
  * Fetches ZenFii transactions and creates users on MikroTik
  */
