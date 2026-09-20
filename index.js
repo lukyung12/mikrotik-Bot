@@ -1,0 +1,388 @@
+/**
+ * ZenFii ↔ MikroTik Automated Hotspot User Bridge
+ * Uses SSH to connect to MikroTik (works with VPN tunnels)
+ * Fetches ZenFii transactions and creates users on MikroTik
+ */
+
+const axios = require('axios');
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+require('dotenv').config();
+
+const app = express();
+
+// Configuration
+const CONFIG = {
+  zenfiiUrl: process.env.ZENFII_URL || 'https://web.zenfii.net',
+  zenfiiUsername: process.env.ZENFII_USERNAME || '',
+  zenfiiPassword: process.env.ZENFII_PASSWORD || '',
+  
+  mikrotikHost: process.env.MIKROTIK_HOST || 'vpn4.xenfi.net',
+  mikrotikPort: parseInt(process.env.MIKROTIK_PORT || 33548),
+  mikrotikUsername: process.env.MIKROTIK_USERNAME || 'admin',
+  mikrotikPassword: process.env.MIKROTIK_PASSWORD || '',
+  
+  pollInterval: parseInt(process.env.POLL_INTERVAL || 120) * 1000,
+  hotspotProfile: process.env.HOTSPOT_PROFILE || 'default',
+  voucherPassword: process.env.VOUCHER_PASSWORD || 'voucher'
+};
+
+// State management
+const state = {
+  processedTransactions: new Set(),
+  lastPollTime: null,
+  isRunning: false
+};
+
+// Load processed transactions from file
+function loadProcessedTransactions() {
+  try {
+    const filePath = path.join(__dirname, 'processed_transactions.json');
+    if (fs.existsSync(filePath)) {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      state.processedTransactions = new Set(data);
+      console.log(`✓ Loaded ${data.length} previously processed transactions`);
+    }
+  } catch (error) {
+    console.error('Error loading processed transactions:', error.message);
+  }
+}
+
+// Save processed transactions to file
+function saveProcessedTransactions() {
+  try {
+    const filePath = path.join(__dirname, 'processed_transactions.json');
+    fs.writeFileSync(filePath, JSON.stringify(Array.from(state.processedTransactions), null, 2));
+  } catch (error) {
+    console.error('Error saving processed transactions:', error.message);
+  }
+}
+
+/**
+ * Execute SSH command on MikroTik
+ */
+async function executeSshCommand(command) {
+  return new Promise((resolve, reject) => {
+    const sshArgs = [
+      '-o', 'StrictHostKeyChecking=no',
+      '-o', 'UserKnownHostsFile=/dev/null',
+      '-p', CONFIG.mikrotikPort.toString(),
+      `${CONFIG.mikrotikUsername}@${CONFIG.mikrotikHost}`,
+      command
+    ];
+
+    const ssh = spawn('ssh', sshArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 15000
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    // Send password via stdin
+    ssh.stdin.write(`${CONFIG.mikrotikPassword}\n`);
+    ssh.stdin.end();
+
+    ssh.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    ssh.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    ssh.on('close', (code) => {
+      if (code === 0 || stdout) {
+        resolve(stdout);
+      } else {
+        reject(new Error(stderr || `SSH command failed with code ${code}`));
+      }
+    });
+
+    ssh.on('error', (error) => {
+      reject(error);
+    });
+
+    // Handle timeout
+    setTimeout(() => {
+      ssh.kill();
+      reject(new Error('SSH command timeout'));
+    }, 15000);
+  });
+}
+
+/**
+ * Create Axios client for ZenFii
+ */
+function createZenFiiClient() {
+  return axios.create({
+    baseURL: CONFIG.zenfiiUrl,
+    auth: {
+      username: CONFIG.zenfiiUsername,
+      password: CONFIG.zenfiiPassword
+    },
+    timeout: 15000,
+    validateStatus: () => true
+  });
+}
+
+/**
+ * Fetch ZenFii transactions
+ */
+async function fetchZenFiiTransactions() {
+  try {
+    console.log('\n📥 Fetching transactions from ZenFii...');
+    
+    const client = createZenFiiClient();
+    
+    // Try multiple endpoints
+    const endpoints = [
+      '/api/v1/transactions',
+      '/api/transactions',
+      '/admin/api/transactions'
+    ];
+    
+    for (const endpoint of endpoints) {
+      try {
+        const response = await client.get(endpoint);
+        
+        if (response.status === 200) {
+          let transactions = [];
+          
+          if (Array.isArray(response.data)) {
+            transactions = response.data;
+          } else if (response.data?.data && Array.isArray(response.data.data)) {
+            transactions = response.data.data;
+          } else if (response.data?.transactions && Array.isArray(response.data.transactions)) {
+            transactions = response.data.transactions;
+          }
+          
+          if (transactions.length > 0) {
+            console.log(`✓ Found ${transactions.length} transaction(s)`);
+            return transactions;
+          }
+        }
+      } catch (err) {
+        // Try next endpoint
+      }
+    }
+    
+    console.log('  No transactions found via API endpoints');
+    return [];
+    
+  } catch (error) {
+    console.error('❌ Error fetching transactions:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Create hotspot user on MikroTik via SSH
+ */
+async function createMikroTikUser(transactionId) {
+  try {
+    // First, check if user exists
+    try {
+      const listCommand = `/ip hotspot user print where name="${transactionId}"`;
+      const result = await executeSshCommand(listCommand);
+      if (result && result.includes(transactionId)) {
+        console.log(`  ℹ️  User '${transactionId}' already exists`);
+        return false;
+      }
+    } catch (err) {
+      // Continue with creation
+    }
+
+    // Create the user
+    const createCommand = `/ip hotspot user add name="${transactionId}" profile="${CONFIG.hotspotProfile}" password="${CONFIG.voucherPassword}"`;
+    
+    try {
+      await executeSshCommand(createCommand);
+      console.log(`✅ Created hotspot user: ${transactionId}`);
+      return true;
+    } catch (error) {
+      console.error(`❌ Failed to create user '${transactionId}': ${error.message}`);
+      return false;
+    }
+    
+  } catch (error) {
+    console.error(`❌ Error creating user '${transactionId}':`, error.message);
+    return false;
+  }
+}
+
+/**
+ * Process a single transaction
+ */
+async function processTransaction(transaction) {
+  const txnId = transaction.id || transaction.transactionId || transaction.payment_id;
+  
+  if (!txnId) {
+    return false;
+  }
+  
+  // Skip if already processed
+  if (state.processedTransactions.has(txnId)) {
+    return false;
+  }
+  
+  console.log(`→ Processing transaction: ${txnId}`);
+  
+  const success = await createMikroTikUser(txnId);
+  
+  if (success) {
+    state.processedTransactions.add(txnId);
+    saveProcessedTransactions();
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Main polling loop
+ */
+async function poll() {
+  try {
+    console.log(`\n[${new Date().toLocaleString()}] Polling...`);
+    
+    const transactions = await fetchZenFiiTransactions();
+    
+    if (transactions.length === 0) {
+      console.log('  ℹ️  No transactions found');
+      return 0;
+    }
+    
+    let processedCount = 0;
+    for (const transaction of transactions) {
+      const success = await processTransaction(transaction);
+      if (success) processedCount++;
+    }
+    
+    state.lastPollTime = new Date();
+    console.log(`✓ Poll complete: ${processedCount} new user(s) created`);
+    
+    return processedCount;
+    
+  } catch (error) {
+    console.error('❌ Poll error:', error.message);
+    return 0;
+  }
+}
+
+/**
+ * Test MikroTik connection
+ */
+async function testMikroTikConnection() {
+  console.log('\n🔗 Testing MikroTik SSH connection...');
+  try {
+    const result = await executeSshCommand('system identity print');
+    if (result && result.length > 0) {
+      console.log('✓ MikroTik SSH connection successful');
+      return true;
+    }
+  } catch (error) {
+    console.error('✗ Cannot connect to MikroTik:', error.message);
+    return false;
+  }
+}
+
+/**
+ * Start the bridge
+ */
+async function start() {
+  console.log('════════════════════════════════════════════════════════');
+  console.log('ZenFii ↔ MikroTik Automated Hotspot User Bridge');
+  console.log('════════════════════════════════════════════════════════');
+  console.log(`
+Configuration:
+  - ZenFii: ${CONFIG.zenfiiUrl}
+  - MikroTik: ${CONFIG.mikrotikHost}:${CONFIG.mikrotikPort} (SSH)
+  - Poll Interval: ${CONFIG.pollInterval / 1000}s
+  - Hotspot Profile: ${CONFIG.hotspotProfile}
+  `);
+  
+  // Load previously processed transactions
+  loadProcessedTransactions();
+  
+  // Test MikroTik connection
+  const mikrotikOk = await testMikroTikConnection();
+  if (!mikrotikOk) {
+    console.error('Cannot start without MikroTik access');
+    process.exit(1);
+  }
+  
+  state.isRunning = true;
+  let pollCount = 0;
+  
+  // Run first poll immediately
+  await poll();
+  pollCount++;
+  
+  // Then poll on interval
+  const pollTimer = setInterval(async () => {
+    if (state.isRunning) {
+      await poll();
+      pollCount++;
+    }
+  }, CONFIG.pollInterval);
+  
+  // Handle graceful shutdown
+  process.on('SIGINT', async () => {
+    console.log('\n\nShutting down...');
+    state.isRunning = false;
+    clearInterval(pollTimer);
+    
+    console.log(`\nStats:
+  - Total polls: ${pollCount}
+  - Total users created: ${state.processedTransactions.size}
+  - Last poll: ${state.lastPollTime || 'Never'}`);
+    
+    process.exit(0);
+  });
+}
+
+/**
+ * Express endpoints
+ */
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    running: state.isRunning,
+    timestamp: new Date(),
+    stats: {
+      processedTransactions: state.processedTransactions.size,
+      lastPoll: state.lastPollTime
+    }
+  });
+});
+
+app.post('/poll', async (req, res) => {
+  const result = await poll();
+  res.json({
+    status: 'completed',
+    processed: result,
+    timestamp: new Date()
+  });
+});
+
+/**
+ * Entry point
+ */
+const PORT = process.env.PORT || 3000;
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`\n🌐 Web server listening on port ${PORT}`);
+    console.log(`   Health: http://localhost:${PORT}/health\n`);
+  });
+  
+  start().catch(error => {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });
+}
+
+module.exports = { start, poll, createMikroTikUser, fetchZenFiiTransactions };
